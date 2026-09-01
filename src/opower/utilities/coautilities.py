@@ -8,11 +8,31 @@ import aiohttp
 from yarl import URL
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 from .helpers import get_form_action_url_and_hidden_inputs
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _post_form(
+    session: aiohttp.ClientSession,
+    url: str,
+    data: dict[str, str],
+    expected_fields: set[str],
+) -> tuple[str, dict[str, str]]:
+    """POST a form and return the action and hidden inputs of the form in the reply."""
+    async with session.post(
+        url,
+        headers={"User-Agent": USER_AGENT},
+        data=data,
+        raise_for_status=True,
+    ) as response:
+        html = await response.text()
+    action_url, hidden_inputs = get_form_action_url_and_hidden_inputs(html)
+    if set(hidden_inputs.keys()) != expected_fields:
+        raise CannotConnect(f"Expected form fields {sorted(expected_fields)}, got {sorted(hidden_inputs)}")
+    return action_url, hidden_inputs
 
 
 class COAUtilities(UtilityBase):
@@ -20,6 +40,7 @@ class COAUtilities(UtilityBase):
 
     def __init__(self) -> None:
         """Initialize."""
+        super().__init__()
         self._web_user_id: str | None = None
 
     @staticmethod
@@ -38,6 +59,10 @@ class COAUtilities(UtilityBase):
         Should match the siteTimeZoneId of the API responses.
         """
         return "America/Chicago"
+
+    def customer_uuid(self) -> str | None:
+        """Return the webUserId captured during login."""
+        return self._web_user_id
 
     @staticmethod
     def is_dss() -> bool:
@@ -131,18 +156,11 @@ class COAUtilities(UtilityBase):
         ) as response:
             html = await response.text()
             action_url, hidden_inputs = get_form_action_url_and_hidden_inputs(html)
-            assert set(hidden_inputs.keys()) == {"RelayState", "SAMLResponse"}
+            if set(hidden_inputs.keys()) != {"RelayState", "SAMLResponse"}:
+                raise CannotConnect("Unexpected SAML response form fields")
 
         # Getting Open Token from opower
-        async with session.post(
-            action_url,
-            headers={"User-Agent": USER_AGENT},
-            data=hidden_inputs,
-            raise_for_status=True,
-        ) as response:
-            html = await response.text()
-            action_url, hidden_inputs = get_form_action_url_and_hidden_inputs(html)
-            assert set(hidden_inputs.keys()) == {"OCIS_REQ_SP"}
+        action_url, hidden_inputs = await _post_form(session, action_url, hidden_inputs, {"OCIS_REQ_SP"})
 
         session.cookie_jar.update_cookies({"dssPortalCW": "1"})
 
@@ -156,7 +174,8 @@ class COAUtilities(UtilityBase):
             await response.text()
             parsed_url = urlparse(str(response.url))
             parsed_query = parse_qs(parsed_url.query)
-            assert "token" in parsed_query
+            if "token" not in parsed_query:
+                raise CannotConnect("No token in the City of Austin SSO redirect")
             token = parsed_query["token"][0]
 
         # Finally exchange this token to Auth token

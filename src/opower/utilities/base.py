@@ -64,6 +64,15 @@ class UtilityBase(abc.ABC):
         """Return the utilitycode identifier for the utility."""
         return self.subdomain()
 
+    def customer_uuid(self) -> str | None:
+        """Return a customer UUID captured during login, if the utility has one.
+
+        DSS portals do not expose a customer UUID through the multi-account API,
+        so a utility that learns one while authenticating can surface it here for
+        the Opower-Selected-Entities header. Returns None when there is none.
+        """
+        return None
+
     @staticmethod
     def supports_realtime_usage() -> bool:
         """Check if Utility supports realtime usage reads."""
