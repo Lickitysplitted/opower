@@ -18,7 +18,7 @@ from .const import USER_AGENT
 from .exceptions import ApiException, CannotConnect, InvalidAuth
 from .utilities import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _parse_read_time(value: str, tz: ZoneInfo) -> datetime:
@@ -251,18 +251,20 @@ class Opower:
         """Initialize."""
         # Note: Do not modify default headers since Home Assistant that uses this library needs to use
         # a default session for all integrations. Instead specify the headers for each request.
-        self.session: aiohttp.ClientSession = session
+        self._session: aiohttp.ClientSession = session
         self.utility: UtilityBase = select_utility(utility)()
-        self.username: str = username
-        self.password: str = password
-        self.optional_totp_secret: str | None = optional_totp_secret
-        if self.utility.accepts_totp_secret() and self.optional_totp_secret:
-            self.utility.set_totp_secret(self.optional_totp_secret.strip())
-        self.login_data: dict[str, Any] = login_data or {}
-        self.access_token: str | None = None
-        self.customers: list[Any] = []
-        self.user_accounts: list[Any] = []
-        self.meters: list[str] = []
+        self._username: str = username
+        self._password: str = password
+        self._optional_totp_secret: str | None = optional_totp_secret
+        if self.utility.accepts_totp_secret() and self._optional_totp_secret:
+            self.utility.set_totp_secret(self._optional_totp_secret.strip())
+        self._login_data: dict[str, Any] = login_data or {}
+        self._access_token: str | None = None
+        self._customers: list[Any] = []
+        self._user_accounts: list[Any] = []
+        # Keyed by account uuid: meters are fetched per account, so a single
+        # list would serve one account's meters for every other account.
+        self._meters: dict[str, list[str]] = {}
 
     async def async_login(self) -> None:
         """Login to the utility website and authorize opower.com for access.
@@ -272,7 +274,9 @@ class Opower:
         :raises CannotConnect: if we receive any HTTP error
         """
         try:
-            self.access_token = await self.utility.async_login(self.session, self.username, self.password, self.login_data)
+            self._access_token = await self.utility.async_login(
+                self._session, self._username, self._password, self._login_data
+            )
         except ClientResponseError as err:
             if err.status in (401, 403):
                 raise InvalidAuth(err) from err
@@ -423,42 +427,52 @@ class Opower:
     async def _async_get_customers(self) -> list[Any]:
         """Get customers associated to the user."""
         # Cache the customers
-        if not self.customers:
-            if self.utility.is_dss() and not self.user_accounts:
+        if not self._customers:
+            if self.utility.is_dss() and not self._user_accounts:
                 await self._async_get_user_accounts()
 
-            url = (
-                f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
-                f"/edge/apis/multi-account-v1/cws/{self.utility.utilitycode()}"
-                "/customers?offset=0&batchSize=100&addressFilter="
-            )
             try:
-                result = await self._async_get_request(url, {}, self._get_headers())
-                for customer in result["customers"]:
-                    self.customers.append(customer)
+                self._customers.extend(await self._async_fetch_multi_account_customers())
             except ApiException as err:
                 if self.utility.is_dss():
                     _LOGGER.debug(
                         "Failed to fetch customers from multi-account-v1, falling back to service agreements: %s",
                         err,
                     )
-                    self.customers = []
+                    self._customers = []
                     await self._async_get_dss_customers()
                 else:
                     raise
 
-        assert self.customers
-        return self.customers
+        if not self._customers:
+            raise CannotConnect(f"No utility customers found for {self.utility.name()}")
+        return self._customers
+
+    async def _async_fetch_multi_account_customers(self) -> list[Any]:
+        """Fetch customers from the multi-account-v1 endpoint.
+
+        :raises ApiException: if the request fails or the response has no
+            "customers" key, so that DSS callers can fall back.
+        """
+        url = (
+            f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
+            f"/edge/apis/multi-account-v1/cws/{self.utility.utilitycode()}"
+            "/customers?offset=0&batchSize=100&addressFilter="
+        )
+        result = await self._async_get_request(url, {}, self._get_headers())
+        if "customers" not in result:
+            raise ApiException("No 'customers' in the multi-account-v1 response", url=url)
+        return list(result["customers"])
 
     async def _async_get_dss_customers(self) -> None:
-        """Populate self.customers for DSS utilities via service agreements.
+        """Populate self._customers for DSS utilities via service agreements.
 
         DSS portals expose service/meter data through bill-trends-v1 rather than
         the multi-account-v1/customers endpoint. We fetch service agreements,
         map their service types to MeterType values, and construct synthetic
         customer records that the rest of the library can consume.
         """
-        if not self.user_accounts:
+        if not self._user_accounts:
             await self._async_get_user_accounts()
 
         account_id = self._get_account_id()
@@ -466,7 +480,7 @@ class Opower:
         # Use the webUserId stored during login as the customer UUID (it is the
         # only UUID-format identifier the identity-management API exposes via
         # Bearer token auth). Fall back to accountId if unavailable.
-        customer_uuid: str = getattr(self.utility, "_web_user_id", None) or account_id
+        customer_uuid: str = self.utility.customer_uuid() or account_id
 
         sa_url = (
             f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/bill-trends-v1/cws/serviceAgreements"
@@ -490,9 +504,9 @@ class Opower:
             )
 
         if utility_accounts:
-            self.customers.append({"uuid": customer_uuid, "utilityAccounts": utility_accounts})
+            self._customers.append({"uuid": customer_uuid, "utilityAccounts": utility_accounts})
 
-        if not self.customers:
+        if not self._customers:
             _LOGGER.warning(
                 "No utility customers found for %s. This may indicate that the "
                 "service agreements endpoint returned unrecognized service types. "
@@ -503,7 +517,7 @@ class Opower:
     async def _async_get_user_accounts(self) -> list[Any]:
         """Get accounts associated to the user."""
         # Cache the accounts
-        if not self.user_accounts:
+        if not self._user_accounts:
             url = (
                 "https://"
                 f"{self._get_subdomain()}"
@@ -514,10 +528,11 @@ class Opower:
             )
             result = await self._async_get_request(url, {}, self._get_headers())
             for account in result["accounts"]:
-                self.user_accounts.append(account)
+                self._user_accounts.append(account)
 
-        assert self.user_accounts
-        return self.user_accounts
+        if not self._user_accounts:
+            raise CannotConnect(f"No user accounts found for {self.utility.name()}")
+        return self._user_accounts
 
     async def async_get_cost_reads(
         self,
@@ -606,7 +621,7 @@ class Opower:
 
         Each meter is a string key for fetching from the realtime data API.
         """
-        if not self.meters:
+        if account.uuid not in self._meters:
             url = (
                 f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
                 f"/edge/apis/cws-real-time-ami-v1/cws/{self.utility.utilitycode()}"
@@ -614,8 +629,8 @@ class Opower:
             )
             headers = self._get_headers(account.customer.uuid)
             result = await self._async_get_request(url, {}, headers)
-            self.meters = list(result["meters_ids"])
-        return self.meters
+            self._meters[account.uuid] = list(result["meters_ids"])
+        return self._meters[account.uuid]
 
     async def async_get_realtime_usage_reads(
         self,
@@ -631,7 +646,8 @@ class Opower:
         function only queries data for the first meter on the account.
         """
         meters = await self._async_get_meters(account)
-        assert len(meters) > 0
+        if not meters:
+            raise CannotConnect(f"No meters found for account {account.id}")
         meter = meters[0]
 
         url = (
@@ -783,22 +799,22 @@ class Opower:
             raise
 
     def _get_account_id(self) -> str:
-        for user_account in self.user_accounts:
+        for user_account in self._user_accounts:
             if len(user_account["premises"]) > 0:
                 # Select first account with assigned premises
                 # Avoid issue with accounts without premises. They could be moved to other accounts,
                 # see https://github.com/tronikos/opower/issues/73 for details
                 return str(user_account["accountId"])
-        return str(self.user_accounts[0]["accountId"])
+        return str(self._user_accounts[0]["accountId"])
 
     def _get_headers(self, customer_uuid: str | None = None) -> dict[str, str]:
         headers = {"User-Agent": USER_AGENT}
-        if self.access_token:
-            headers["authorization"] = f"Bearer {self.access_token}"
+        if self._access_token:
+            headers["authorization"] = f"Bearer {self._access_token}"
 
         opower_selected_entities: list[str] = []
         if self.utility.is_dss():
-            if self.user_accounts:
+            if self._user_accounts:
                 # Required for DSS endpoints
                 opower_selected_entities.append(f"urn:session:account:{self._get_account_id()}")
             # Required for all DSS endpoints; without this the customers endpoint returns
@@ -829,7 +845,7 @@ class Opower:
         full_url = f"{url}?{urlencode(params)}"
         _LOGGER.debug("Fetching: %s", full_url)
         try:
-            async with self.session.get(url, params=params, headers=headers) as resp:
+            async with self._session.get(url, params=params, headers=headers) as resp:
                 if not resp.ok:
                     raise ApiException(
                         f"HTTP Error: {resp.status}",
@@ -848,7 +864,7 @@ class Opower:
         url = f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}/edge/apis/dsm-graphql-v1/cws/graphql"
         _LOGGER.debug("GraphQL query to: %s", url)
         try:
-            async with self.session.post(
+            async with self._session.post(
                 url,
                 headers={**headers, "Content-Type": "application/json"},
                 json={"query": query},
