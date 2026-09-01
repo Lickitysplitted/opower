@@ -81,7 +81,25 @@ pytest
 python -m opower --help
 # To output debug logs and API responses to a file run:
 python -m opower -vv 2> out.txt
+```
 
+Instead of passing credentials on the command line or typing them at the prompts,
+you can put them in the environment or in a `.env` file in the current directory:
+
+```sh
+OPOWER_UTILITY=pge
+OPOWER_USERNAME=user@example.com
+OPOWER_PASSWORD=secret
+# Only for utilities with TOTP-based MFA
+OPOWER_TOTP_SECRET=...
+# Only for utilities with interactive MFA, e.g. PG&E
+OPOWER_LOGIN_DATA_FILE=login_data.txt
+```
+
+Real environment variables take precedence over the `.env` file, and command line
+arguments take precedence over both.
+
+```sh
 # Build package
 python -m pip install build
 python -m build

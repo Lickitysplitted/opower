@@ -6,6 +6,7 @@ import asyncio
 import csv
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from getpass import getpass
 from pathlib import Path
@@ -23,6 +24,31 @@ from opower import (
     get_supported_utilities,
     select_utility,
 )
+
+
+def _unquote(value: str) -> str:
+    """Remove one matching pair of surrounding quotes, leaving the value otherwise intact.
+
+    Stripping every quote character instead would corrupt a value that
+    legitimately starts or ends with one, such as a password of ``"secret``.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
+    """Read simple KEY=VALUE lines from a .env file, if one exists."""
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = _unquote(value.strip())
+    return values
 
 
 async def _main() -> None:
@@ -88,15 +114,36 @@ async def _main() -> None:
 
     logging.basicConfig(level=logging.DEBUG - args.verbose + 1 if args.verbose > 0 else logging.INFO)
 
-    utility = args.utility or input(f"Utility, one of {supported_utilities}: ")
+    dotenv = _load_dotenv()
+
+    def env(key: str) -> str | None:
+        """Return key from the real environment, else from the .env file.
+
+        A real environment variable wins over the .env file, matching python-dotenv.
+        """
+        return os.environ.get(key) or dotenv.get(key)
+
+    def resolve(arg: str | None, key: str, prompt: str, secret: bool = False) -> str:
+        """Return the command line argument, else the environment, else ask for it."""
+        value = arg or env(key)
+        if value:
+            return value
+        return getpass(prompt) if secret else input(prompt)
+
+    utility = resolve(args.utility, "OPOWER_UTILITY", f"Utility, one of {supported_utilities}: ")
     utility_class = select_utility(utility)
-    username = args.username or input("Username: ")
-    password = args.password or getpass("Password: ")
-    totp_secret = args.totp_secret or (getpass("TOTP secret: ") if utility_class.accepts_totp_secret() else None)
+    username = resolve(args.username, "OPOWER_USERNAME", "Username: ")
+    password = resolve(args.password, "OPOWER_PASSWORD", "Password: ", secret=True)
+    totp_secret = (
+        resolve(args.totp_secret, "OPOWER_TOTP_SECRET", "TOTP secret: ", secret=True)
+        if utility_class.accepts_totp_secret()
+        else None
+    )
+    login_data_file = args.login_data_file or env("OPOWER_LOGIN_DATA_FILE")
     login_data = None
-    if args.login_data_file:
+    if login_data_file:
         try:
-            with open(args.login_data_file) as file:
+            with open(login_data_file) as file:
                 login_data = json.load(file)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -132,8 +179,8 @@ async def _main() -> None:
                 return
             else:
                 print("MFA validation successful.")
-                if args.login_data_file:
-                    with open(args.login_data_file, "w") as file:
+                if login_data_file:
+                    with open(login_data_file, "w") as file:
                         json.dump(login_data, file, indent=4)
                 opower = Opower(session, utility, username, password, totp_secret, login_data)
                 await opower.async_login()
