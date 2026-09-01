@@ -1,7 +1,8 @@
 """Tests for Opower."""
 
+import asyncio
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
@@ -23,10 +24,16 @@ if TYPE_CHECKING:
     from opower.utilities import UtilityBase
 
 
+@pytest.mark.network
 @pytest.mark.parametrize("utility", get_supported_utilities())
 @pytest.mark.asyncio
 async def test_invalid_auth(utility: type["UtilityBase"]) -> None:
-    """Test invalid username/password raises InvalidAuth."""
+    """Test invalid username/password raises InvalidAuth.
+
+    This performs a real failed login against every supported utility's live
+    website, so it is excluded from the default run (see the "network" marker
+    in pyproject.toml) and must be requested explicitly with `-m network`.
+    """
     async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
         opower = Opower(
             session,
@@ -246,9 +253,9 @@ async def test_five_minute_read_resolution(
             start_date: datetime | None = None,
             end_date: datetime | None = None,
             usage_only: bool = False,
-        ) -> list[dict[str, object]]:
+        ) -> tuple[list[dict[str, object]], bool]:
             calls.append(aggregate_type)
-            return [{"start": start_date, "end": end_date, "usage_only": usage_only}]
+            return [{"start": start_date, "end": end_date, "usage_only": usage_only}], False
 
         monkeypatch.setattr(opower, "_async_get_customers", fake_get_customers)
         monkeypatch.setattr(opower, "_async_fetch", fake_async_fetch)
@@ -264,6 +271,162 @@ async def test_five_minute_read_resolution(
             datetime(2026, 1, 1),
         )
         assert calls == [AggregateType.QUARTER_HOUR]
+
+
+@pytest.mark.asyncio
+async def test_dss_bill_trends_fallback_is_not_refetched_per_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bill-trends fallback must not be re-fetched once per date batch.
+
+    DSS utilities whose DataBrowser-v1 is inaccessible fall back to
+    bill-trends, which returns the full bill history regardless of the
+    requested window. Batching the request across a multi-year range would
+    otherwise return every bill once per window.
+    """
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "City of Austin Utilities",
+            username="test",
+            password="test",  # noqa: S106
+        )
+        opower._user_accounts = [{"accountId": "123", "premises": ["p"]}]
+
+        requested_urls: list[str] = []
+
+        async def fake_get_request(url: str, params: dict[str, str], headers: dict[str, str]) -> Any:
+            requested_urls.append(url)
+            if "DataBrowser-v1" in url:
+                raise ApiException("HTTP Error: 403", url=url, status=403)
+            return {
+                "bills": [
+                    {"billDate": "2024-03-15", "cost": 120.0},
+                    {"billDate": "2024-02-15", "cost": 110.0},
+                    {"billDate": "2024-01-15", "cost": 100.0},
+                ]
+            }
+
+        monkeypatch.setattr(opower, "_async_get_request", fake_get_request)
+
+        account = Account(
+            customer=Mock(uuid="customer-uuid"),
+            uuid="sa1",
+            utility_account_id="123",
+            id="123",
+            meter_type=MeterType.ELEC,
+            read_resolution=ReadResolution.DAY,
+        )
+
+        # A three-year range spans several 363-day batches.
+        result = await opower.async_get_cost_reads(account, AggregateType.DAY, datetime(2023, 1, 1), datetime(2025, 12, 31))
+
+        # Two periods derived from three bills, each returned exactly once.
+        assert [(read.provided_cost, read.start_time.date().isoformat()) for read in result] == [
+            (110.0, "2024-01-16"),
+            (120.0, "2024-02-16"),
+        ]
+        assert sum("billHistory" in url for url in requested_urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fetches_do_not_share_dss_fallback_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whether a fetch fell back to bill-trends must not leak between callers.
+
+    _async_fetch reports the fallback through its return value. Tracking it on
+    the client instead would let a usage-only fetch observe a concurrent cost
+    fetch's fallback and stop batching after a single window.
+    """
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "City of Austin Utilities",
+            username="test",
+            password="test",  # noqa: S106
+        )
+        opower._user_accounts = [{"accountId": "123", "premises": ["p"]}]
+
+        usage_windows: list[str] = []
+        cost_fell_back = asyncio.Event()
+
+        async def fake_get_request(url: str, params: dict[str, str], headers: dict[str, str]) -> Any:
+            if "cost/utilityAccount" in url:
+                # DataBrowser-v1 is inaccessible for this DSS utility.
+                raise ApiException("HTTP Error: 403", url=url, status=403)
+            if "billHistory" in url:
+                cost_fell_back.set()
+                return {"bills": [{"billDate": "2024-02-15", "cost": 110.0}, {"billDate": "2024-01-15", "cost": 100.0}]}
+            usage_windows.append(params["startDate"])
+            # Hold the first usage window open until the cost call has fallen
+            # back, so the two are guaranteed to interleave.
+            if len(usage_windows) == 1:
+                await cost_fell_back.wait()
+            return {
+                "reads": [
+                    {"startTime": "2024-01-01T00:00:00", "endTime": "2024-01-02T00:00:00", "consumption": {"value": 1.0}}
+                ]
+            }
+
+        monkeypatch.setattr(opower, "_async_get_request", fake_get_request)
+
+        account = Account(
+            customer=Mock(uuid="customer-uuid"),
+            uuid="sa1",
+            utility_account_id="123",
+            id="123",
+            meter_type=MeterType.ELEC,
+            read_resolution=ReadResolution.DAY,
+        )
+        start, end = datetime(2023, 1, 1), datetime(2025, 12, 31)
+
+        await asyncio.gather(
+            opower.async_get_usage_reads(account, AggregateType.DAY, start, end),
+            opower.async_get_cost_reads(account, AggregateType.DAY, start, end),
+        )
+
+        # The usage call must keep batching across its own windows regardless of
+        # what the concurrent cost call did.
+        assert len(usage_windows) > 1
+
+
+@pytest.mark.asyncio
+async def test_meters_are_cached_per_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Meters are fetched per account, so the cache must be keyed by account.
+
+    A customer typically has both an electricity and a gas account; a single
+    shared cache would serve the first account's meters for every other one.
+    """
+    async with aiohttp.ClientSession(cookie_jar=create_cookie_jar()) as session:
+        opower = Opower(
+            session,
+            "Consolidated Edison (ConEd)",
+            username="test",
+            password="test",  # noqa: S106
+        )
+
+        async def fake_get_request(url: str, params: dict[str, str], headers: dict[str, str]) -> Any:
+            account_uuid = url.split("/accounts/")[1].split("/", maxsplit=1)[0]
+            return {"meters_ids": [f"meter-for-{account_uuid}"]}
+
+        monkeypatch.setattr(opower, "_async_get_request", fake_get_request)
+
+        def account(uuid: str) -> Account:
+            return Account(
+                customer=Mock(uuid="customer-uuid"),
+                uuid=uuid,
+                utility_account_id=uuid,
+                id=uuid,
+                meter_type=MeterType.ELEC,
+                read_resolution=ReadResolution.QUARTER_HOUR,
+            )
+
+        assert await opower._async_get_meters(account("elec")) == ["meter-for-elec"]
+        assert await opower._async_get_meters(account("gas")) == ["meter-for-gas"]
+        # Still cached: a repeat lookup must not re-request.
+        monkeypatch.setattr(opower, "_async_get_request", None)
+        assert await opower._async_get_meters(account("elec")) == ["meter-for-elec"]
 
 
 @pytest.mark.asyncio

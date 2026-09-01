@@ -23,6 +23,14 @@ test = [
 ]
 
 
+[tool.pytest.ini_options]
+markers = [
+    "network: hits live utility websites; excluded from the default run",
+]
+# Keep the default run hermetic: the network tests log in to ~36 third-party
+# sites, so letting them gate CI makes it fail for reasons unrelated to a change.
+addopts = "-m 'not network'"
+
 [project.urls]
 "Homepage" = "https://github.com/tronikos/opower"
 "Bug Tracker" = "https://github.com/tronikos/opower/issues"
