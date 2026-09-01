@@ -683,7 +683,8 @@ class Opower:
             )
         if start_date is None:
             if aggregate_type == AggregateType.BILL:
-                return await self._async_fetch(account, aggregate_type, start_date, end_date, usage_only)
+                reads, _ = await self._async_fetch(account, aggregate_type, start_date, end_date, usage_only)
+                return reads
             raise ValueError("start_date is required unless aggregate_type=BILL")
         if end_date is None:
             raise ValueError("end_date is required unless aggregate_type=BILL")
@@ -711,7 +712,12 @@ class Opower:
                 req_start = max(start, req_end.shift(days=-max_request_days))
             if req_start >= req_end:
                 return result
-            reads = await self._async_fetch(account, aggregate_type, req_start, req_end, usage_only)
+            reads, from_dss_bills = await self._async_fetch(account, aggregate_type, req_start, req_end, usage_only)
+            if from_dss_bills:
+                # The bill-trends fallback ignores the requested window and
+                # always returns the full bill history, so asking for the
+                # remaining windows would return the very same reads again.
+                return reads
             if not reads:
                 return result
             result = reads + result
@@ -763,7 +769,12 @@ class Opower:
         start_date: datetime | arrow.Arrow | None = None,
         end_date: datetime | arrow.Arrow | None = None,
         usage_only: bool = False,
-    ) -> list[Any]:
+    ) -> tuple[list[Any], bool]:
+        """Fetch reads for one window.
+
+        Returns the reads and whether they came from the bill-trends fallback,
+        which ignores the requested window and returns the full bill history.
+        """
         if usage_only:
             url = (
                 f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
@@ -784,18 +795,18 @@ class Opower:
             params["endDate"] = (end_date.date() if convert_to_date else end_date).isoformat()
         try:
             result = await self._async_get_request(url, params, headers)
-            return list(result["reads"])
+            return list(result["reads"]), False
         except ApiException as err:
             # Ignore server errors for BILL requests
             # that can happen if end_date is before account activation
             if err.status == 500 and aggregate_type == AggregateType.BILL:
                 _LOGGER.debug("Ignoring error while fetching bill data: %s", err)
-                return []
+                return [], False
             # DSS utilities with a bill-trends fallback: if DataBrowser-v1 is
             # inaccessible (403) fall back to monthly bill history.
             if err.status == 403 and self.utility.uses_bill_trends_for_reads() and not usage_only:
                 _LOGGER.debug("DataBrowser-v1 returned 403 for DSS, falling back to bill history: %s", err)
-                return await self._async_fetch_dss_bills()
+                return await self._async_fetch_dss_bills(), True
             raise
 
     def _get_account_id(self) -> str:
