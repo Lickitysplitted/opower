@@ -4,9 +4,8 @@ from typing import Any
 
 import aiohttp
 
-# --- FIX: Import the USER_AGENT constant ---
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 
 
@@ -50,7 +49,6 @@ class SouthwestGas(UtilityBase):
         api_url = f"{base_url}/ei/edge/apis/user-account-control-v1/cws/v1/{self.subdomain()}/account/signin"
 
         # 2. Define Headers
-        # --- FIX: Use the imported USER_AGENT constant instead of hardcoding one ---
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json, text/plain, */*",
@@ -82,18 +80,25 @@ class SouthwestGas(UtilityBase):
             headers=login_headers,
             raise_for_status=False,
         ) as resp:
-            # --- HANDLE 204 SUCCESS ---
+            # A 204 means the login succeeded and the session is carried by the
+            # cookie that was just set. Return None rather than a placeholder
+            # string: any truthy return is used by Opower as a bearer token and
+            # would be sent as "Authorization: Bearer ..." on every API call.
             if resp.status == 204:
-                return "cookie-auth-success"
+                return None
 
-            # If it's not 200 or 204, fail.
+            # Only treat an explicit rejection as bad credentials. Throttling,
+            # 5xx and other failures are not something a different password
+            # would fix, so they must not trigger a reauth prompt.
+            if resp.status in (401, 403):
+                raise InvalidAuth(f"Login failed: {resp.status} - {await resp.text()}")
+            resp.raise_for_status()
             if resp.status != 200:
-                error_text = await resp.text()
-                raise InvalidAuth(f"Login failed: {resp.status} - {error_text}")
+                raise CannotConnect(f"Unexpected status from SWG login: {resp.status}")
 
             try:
                 result = await resp.json()
-            except Exception as exc:
+            except (aiohttp.ContentTypeError, ValueError) as exc:
                 raise InvalidAuth("Unexpected response from SWG login") from exc
 
         # 6. Extract Token (Only if response was 200 JSON)

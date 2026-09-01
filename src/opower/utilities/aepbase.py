@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 
 
 class AEPLoginParser(HTMLParser):
@@ -50,7 +50,8 @@ class AEPBase(ABC):
 
     def subdomain(self) -> str:
         """Return the opower.com subdomain for this utility."""
-        assert self._subdomain, "async_login not called"
+        if not self._subdomain:
+            raise CannotConnect("async_login was not called before subdomain")
         return self._subdomain
 
     @staticmethod
@@ -104,7 +105,8 @@ class AEPBase(ABC):
             raise InvalidAuth(match.group(1).strip())
 
         match = re.search(r"https://([^.]*).opower.com", html)
-        assert match
+        if not match:
+            raise CannotConnect("Could not find the opower.com subdomain on the AEP usage page")
         self._subdomain = match.group(1)
 
         async with session.get(

@@ -8,10 +8,10 @@ from typing import Any
 import aiohttp
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class EvergyDavinciWidgetParser(HTMLParser):
@@ -68,7 +68,8 @@ class EvergyLoginHandler:
             parse_auth_data.feed(await resp.text())
             self.auth_data = parse_auth_data.data
 
-            assert self.auth_data, "Failed to get davinci widget data"
+            if not self.auth_data:
+                raise CannotConnect("Failed to get davinci widget data from the Evergy login page")
 
     async def get_sdktoken(self) -> None:
         """First get the access_token."""
@@ -190,10 +191,10 @@ class EvergyLoginHandler:
             raise_for_status=True,
         ) as resp:
             data = await resp.json()
-            """If the submitted login form returns a different flowId, then the username doesn't exist."""
+            # A different flowId in the reply means the username doesn't exist.
             if data["flowId"] != self.flowId:
                 raise InvalidAuth("No such username. Login failed.")
-            """If the submitted login form returns the same ID, then the password isn't correct."""
+            # The same id coming back means the password isn't correct.
             if data["id"] == self.id:
                 raise InvalidAuth("Wrong password. Login failed.")
             self.id = data["id"]
@@ -306,24 +307,25 @@ class EvergyLoginHandler:
             await resp.json(content_type=None)
 
     async def login(self, username: str, password: str) -> None:
-        """First parse davinci widget for api data."""
-        await EvergyLoginHandler.get_auth_data(self)
-        """Get the access_token."""
-        await EvergyLoginHandler.get_sdktoken(self)
-        """Start the flow."""
-        await EvergyLoginHandler.start_flow(self)
-        """Retrieve submit form."""
-        await EvergyLoginHandler.get_login_form(self)
-        """Submit login form."""
-        await EvergyLoginHandler.submit_login_form(self, username, password)
-        """Retrieve new connection id."""
-        await EvergyLoginHandler.get_new_connection_id(self)
-        """Set complete to generate cookie."""
-        await EvergyLoginHandler.get_new_connection_cookie(self)
-        """Set cookie and generate new access_token."""
-        await EvergyLoginHandler.get_new_access_token(self)
-        """Postprocess url at Evergy to get access by cookie."""
-        await EvergyLoginHandler.postprocessing_api(self)
+        """Run the full davinci widget login flow."""
+        # Parse the davinci widget for api data.
+        await self.get_auth_data()
+        # Get the access_token.
+        await self.get_sdktoken()
+        # Start the flow.
+        await self.start_flow()
+        # Retrieve the submit form.
+        await self.get_login_form()
+        # Submit the login form.
+        await self.submit_login_form(username, password)
+        # Retrieve the new connection id.
+        await self.get_new_connection_id()
+        # Set complete to generate the cookie.
+        await self.get_new_connection_cookie()
+        # Set the cookie and generate a new access_token.
+        await self.get_new_access_token()
+        # Postprocess the url at Evergy to get access by cookie.
+        await self.postprocessing_api()
 
 
 class Evergy(UtilityBase):
@@ -341,7 +343,8 @@ class Evergy(UtilityBase):
 
     def subdomain(self) -> str:
         """Return the opower.com subdomain for this utility."""
-        assert self._subdomain, "async_login not called"
+        if not self._subdomain:
+            raise CannotConnect("async_login was not called before subdomain")
         return self._subdomain
 
     @staticmethod
@@ -367,9 +370,12 @@ class Evergy(UtilityBase):
             headers={"User-Agent": USER_AGENT},
             raise_for_status=False,
         ) as resp:
-            opower_access_token = resp.headers["jwt"].removeprefix("Bearer ")
-
-            assert opower_access_token, "Failed to parse OPower bearer token"
+            # The header is absent when the session was not established, so do
+            # not index into it blindly.
+            jwt_header = resp.headers.get("jwt", "")
+            opower_access_token = jwt_header.removeprefix("Bearer ")
+            if not opower_access_token:
+                raise CannotConnect(f"Failed to parse the Opower bearer token from Evergy (status {resp.status})")
 
         async with session.get(
             "https://www.evergy.com/sc-api/account/getaccountpremiseselector",

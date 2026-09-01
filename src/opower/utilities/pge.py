@@ -45,6 +45,9 @@ class PgeMfaHandler(MfaHandlerBase):
         self._session = session
         self._password = password
         self._data = data
+        # async_get_mfa_options may legitimately return no options, in which
+        # case async_submit_mfa_code is called without a prior selection.
+        self._option_id: str | None = None
 
     async def async_get_mfa_options(self) -> dict[str, str]:
         """Return a dictionary of MFA options available to the user."""

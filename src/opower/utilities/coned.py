@@ -6,7 +6,7 @@ import aiohttp
 from pyotp import TOTP
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 
 RETURN_URL = "/en/accounts-billing/my-account/energy-use"
@@ -106,7 +106,8 @@ class ConEd(UtilityBase):
             else:
                 raise InvalidAuth("Login Failed")
 
-            assert redirectUrl
+            if not redirectUrl:
+                raise CannotConnect("ConEd login did not return a redirect URL")
             async with session.get(
                 redirectUrl,
                 headers={
