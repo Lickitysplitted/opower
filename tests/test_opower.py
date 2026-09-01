@@ -1,7 +1,8 @@
 """Tests for Opower."""
 
 import asyncio
-from datetime import datetime
+import json
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
@@ -12,13 +13,19 @@ import pytest
 from opower import (
     Account,
     AggregateType,
+    CannotConnect,
     MeterType,
     Opower,
     ReadResolution,
+    UnitOfMeasure,
     create_cookie_jar,
     get_supported_utilities,
+    get_supported_utility_names,
+    select_utility,
 )
 from opower.exceptions import ApiException, InvalidAuth
+from opower.opower import Customer
+from opower.utilities.pge import PGE
 
 if TYPE_CHECKING:
     from opower.utilities import UtilityBase
@@ -480,3 +487,776 @@ async def test_naive_read_times_localized_to_utility_timezone(
         assert result[0].end_time == datetime(2026, 6, 2, tzinfo=tz)
         assert result[0].start_time.tzinfo is not None
         assert result[0].end_time.tzinfo is not None
+
+
+# --- Fake session --------------------------------------------------------
+#
+# The tests below drive the client through its real request layer so that URL
+# construction, headers, batching and the fallbacks between endpoints are
+# covered too. The payloads mirror the shape of real PG&E responses; the
+# identifiers and values in them are made up.
+
+
+class _FakeResponse:
+    """Minimal stand-in for aiohttp.ClientResponse."""
+
+    def __init__(self, payload: Any, status: int = 200) -> None:
+        """Initialize with the payload to serve and the HTTP status."""
+        self.status = status
+        self._payload = payload
+
+    @property
+    def ok(self) -> bool:
+        """Mimic aiohttp: any status below 400 is a success."""
+        return self.status < 400
+
+    async def json(self) -> Any:
+        """Return the canned payload."""
+        return self._payload
+
+    async def text(self) -> str:
+        """Return the canned payload serialized, as aiohttp would."""
+        return json.dumps(self._payload)
+
+    async def __aenter__(self) -> "_FakeResponse":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _FakeSession:
+    """Serves canned responses keyed by URL substring and records requests.
+
+    A route value is either a payload, a `_FakeResponse` (to serve an error
+    status) or a callable taking the query parameters and returning either.
+    """
+
+    def __init__(self, routes: dict[str, Any]) -> None:
+        """Initialize with the routes to serve."""
+        self._routes = routes
+        self.requests: list[dict[str, Any]] = []
+
+    def _handle(self, method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        self.requests.append({"method": method, "url": url, **kwargs})
+        for substring, route in self._routes.items():
+            if substring in url:
+                result = route(kwargs.get("params") or {}) if callable(route) else route
+                return result if isinstance(result, _FakeResponse) else _FakeResponse(result)
+        raise AssertionError(f"Unexpected request to {url}")
+
+    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+        """Serve a GET request."""
+        return self._handle("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        """Serve a POST request."""
+        return self._handle("POST", url, **kwargs)
+
+
+_CUSTOMER_UUID = "11111111-1111-11e5-bf2b-000000000001"
+_ELEC_ACCOUNT_UUID = "22222222-2222-11e5-bf2b-000000000002"
+_GAS_ACCOUNT_UUID = "33333333-3333-11e5-bf2b-000000000003"
+
+# Shape of a real pge.opower.com multi-account-v1 response.
+_CUSTOMERS_RESPONSE = {
+    "customers": [
+        {
+            "id": 10000001,
+            "uuid": _CUSTOMER_UUID,
+            "legacyOpowerId": "3f-1-000000",
+            "accountNumber": "1000000001",
+            "accountName": "TEST RES 1000000001",
+            "address": {
+                "uuid": "44444444-4444-11e3-9228-000000000004",
+                "streetNumber": "1",
+                "streetName": "MAIN ST",
+                "subpremise": None,
+                "postalCode": "94000",
+                "city": "TESTVILLE",
+                "country": "US",
+                "state": "CA",
+            },
+            "type": "RESIDENTIAL",
+            "utilityAccounts": [
+                {
+                    "id": 20000001,
+                    "uuid": _ELEC_ACCOUNT_UUID,
+                    "utilityAccountId": "1000000002",
+                    "utilityAccountId2": "1000000003",
+                    "servicePointId": 3000001,
+                    "meterType": "ELEC",
+                    "preferredUtilityAccountId": "1000000003",
+                    "readResolution": "QUARTER_HOUR",
+                }
+            ],
+        }
+    ],
+    "offset": 0,
+    "batchSize": 100,
+    "total": 1,
+}
+
+
+_ACCESS_TOKEN = "test-token"  # noqa: S105
+
+
+def _pge(session: _FakeSession) -> Opower:
+    """Return a PG&E client wired to a fake session and already "logged in"."""
+    opower = Opower(
+        session,  # type: ignore[arg-type]
+        "Pacific Gas and Electric Company (PG&E)",
+        username="test",
+        password="test",  # noqa: S106
+    )
+    opower._access_token = _ACCESS_TOKEN
+    return opower
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_parses_customers_response() -> None:
+    """Parse accounts out of a multi-account-v1 response."""
+    session = _FakeSession({"multi-account-v1": _CUSTOMERS_RESPONSE})
+    accounts = await _pge(session).async_get_accounts()
+
+    assert len(accounts) == 1
+    account = accounts[0]
+    assert account.customer.uuid == _CUSTOMER_UUID
+    assert account.uuid == _ELEC_ACCOUNT_UUID
+    # preferredUtilityAccountId, not utilityAccountId, and unique so it is the id.
+    assert account.utility_account_id == "1000000003"
+    assert account.id == "1000000003"
+    assert account.meter_type is MeterType.ELEC
+    assert account.read_resolution is ReadResolution.QUARTER_HOUR
+
+    request = session.requests[0]
+    assert request["url"].startswith("https://pge.opower.com/ei/edge/apis/multi-account-v1/cws/pge/customers")
+    assert request["headers"]["authorization"] == f"Bearer {_ACCESS_TOKEN}"
+    # The customer is not known yet, so no customer claim is sent for this request.
+    assert "Opower-Selected-Entities" not in request["headers"]
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_falls_back_to_uuid_for_duplicate_utility_account_id() -> None:
+    """Accounts sharing a preferredUtilityAccountId are identified by uuid.
+
+    Electricity and gas on one bill can share the utility account id, which
+    would otherwise give both accounts the same id.
+    See https://github.com/home-assistant/core/issues/108260.
+    """
+    customers = {
+        "customers": [
+            {
+                "uuid": _CUSTOMER_UUID,
+                "utilityAccounts": [
+                    {
+                        "uuid": _ELEC_ACCOUNT_UUID,
+                        "preferredUtilityAccountId": "1000000003",
+                        "meterType": "ELEC",
+                        "readResolution": "QUARTER_HOUR",
+                    },
+                    {
+                        "uuid": _GAS_ACCOUNT_UUID,
+                        "preferredUtilityAccountId": "1000000003",
+                        "meterType": "GAS",
+                        "readResolution": "DAY",
+                    },
+                ],
+            }
+        ]
+    }
+    accounts = await _pge(_FakeSession({"multi-account-v1": customers})).async_get_accounts()
+
+    assert [account.id for account in accounts] == [_ELEC_ACCOUNT_UUID, _GAS_ACCOUNT_UUID]
+    assert [account.utility_account_id for account in accounts] == ["1000000003", "1000000003"]
+    assert [account.meter_type for account in accounts] == [MeterType.ELEC, MeterType.GAS]
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_raises_when_no_customers() -> None:
+    """An empty customers list is not a usable login."""
+    opower = _pge(_FakeSession({"multi-account-v1": {"customers": []}}))
+    with pytest.raises(CannotConnect):
+        await opower.async_get_accounts()
+
+
+@pytest.mark.asyncio
+async def test_get_forecast_parses_graphql_response() -> None:
+    """Parse the bill forecast, mapping the "TH" unit to THERM."""
+    customers = {
+        "customers": [
+            {
+                "uuid": _CUSTOMER_UUID,
+                "utilityAccounts": [
+                    {
+                        "uuid": _ELEC_ACCOUNT_UUID,
+                        "preferredUtilityAccountId": "1000000003",
+                        "meterType": "ELEC",
+                        "readResolution": "QUARTER_HOUR",
+                    },
+                    {
+                        "uuid": _GAS_ACCOUNT_UUID,
+                        "preferredUtilityAccountId": "1000000004",
+                        "meterType": "GAS",
+                        "readResolution": "DAY",
+                    },
+                ],
+            }
+        ]
+    }
+    graphql = {
+        "data": {
+            "billingAccountsConnection": {
+                "edges": [
+                    {
+                        "node": {
+                            "billForecast": {
+                                "timeInterval": "2026-07-30T00:00:00-07:00/2026-08-31T00:00:00-07:00",
+                                "currentDateTime": "2026-08-15T00:00:00-07:00",
+                                "segments": [
+                                    {
+                                        "serviceAgreement": {"uuid": _ELEC_ACCOUNT_UUID},
+                                        "estimatedUsage": {"value": 500.0, "unit": "KWH"},
+                                        "estimatedUsageCharges": {"value": 150.0},
+                                        "soFarUsage": {"value": 240.0},
+                                        "soFarUsageCharges": {"value": 72.0},
+                                        "priorYearUsage": {"value": 480.0},
+                                        "priorYearUsageCharges": {"value": 140.0},
+                                    },
+                                    {
+                                        "serviceAgreement": {"uuid": _GAS_ACCOUNT_UUID},
+                                        # Gas is reported in "TH", which is not a UnitOfMeasure value.
+                                        "estimatedUsage": {"value": 12.0, "unit": "TH"},
+                                        "estimatedUsageCharges": {"value": 30.0},
+                                        "soFarUsage": {"value": 6.0},
+                                        "soFarUsageCharges": {"value": 15.0},
+                                        "priorYearUsage": {"value": 11.0},
+                                        "priorYearUsageCharges": {"value": 28.0},
+                                    },
+                                ],
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    session = _FakeSession({"multi-account-v1": customers, "dsm-graphql-v1": graphql})
+    forecasts = await _pge(session).async_get_forecast()
+
+    assert len(forecasts) == 2
+    elec, gas = forecasts
+    assert elec.account.uuid == _ELEC_ACCOUNT_UUID
+    assert elec.start_date == date(2026, 7, 30)
+    assert elec.end_date == date(2026, 8, 31)
+    assert elec.current_date == date(2026, 8, 15)
+    assert elec.unit_of_measure is UnitOfMeasure.KWH
+    assert (elec.usage_to_date, elec.cost_to_date) == (240.0, 72.0)
+    assert (elec.forecasted_usage, elec.forecasted_cost) == (500.0, 150.0)
+    assert (elec.typical_usage, elec.typical_cost) == (480.0, 140.0)
+    assert gas.unit_of_measure is UnitOfMeasure.THERM
+    assert gas.forecasted_usage == 12.0
+
+    graphql_request = next(r for r in session.requests if "dsm-graphql-v1" in r["url"])
+    assert graphql_request["method"] == "POST"
+    assert "billForecast" in graphql_request["json"]["query"]
+
+
+@pytest.mark.asyncio
+async def test_get_forecast_without_estimates_defaults_by_meter_type() -> None:
+    """A forecast with no estimate yet keeps the account's default unit.
+
+    PG&E returns null estimates at the start of a billing period.
+    """
+    graphql = {
+        "data": {
+            "billingAccountsConnection": {
+                "edges": [
+                    {
+                        "node": {
+                            "billForecast": {
+                                "timeInterval": "2026-08-31T00:00:00-07:00/2026-10-01T00:00:00-07:00",
+                                "currentDateTime": "2026-09-02T00:00:00-07:00",
+                                "segments": [
+                                    {
+                                        "serviceAgreement": {"uuid": _ELEC_ACCOUNT_UUID},
+                                        "estimatedUsage": None,
+                                        "estimatedUsageCharges": None,
+                                        "soFarUsage": {"value": 0.0},
+                                        "soFarUsageCharges": {"value": 0.0},
+                                        "priorYearUsage": {"value": 241.0},
+                                        "priorYearUsageCharges": {"value": 51.0},
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    session = _FakeSession({"multi-account-v1": _CUSTOMERS_RESPONSE, "dsm-graphql-v1": graphql})
+    forecasts = await _pge(session).async_get_forecast()
+
+    assert len(forecasts) == 1
+    assert forecasts[0].unit_of_measure is UnitOfMeasure.KWH
+    assert forecasts[0].forecasted_usage == 0
+    assert forecasts[0].forecasted_cost == 0
+    assert forecasts[0].typical_usage == 241.0
+
+
+@pytest.mark.asyncio
+async def test_get_forecast_skips_unusable_segments() -> None:
+    """Skip forecasts for unknown accounts, and nodes without a usable interval."""
+    graphql = {
+        "data": {
+            "billingAccountsConnection": {
+                "edges": [
+                    {"node": {"billForecast": None}},
+                    {"node": {"billForecast": {"timeInterval": "", "segments": []}}},
+                    {
+                        "node": {
+                            "billForecast": {
+                                "timeInterval": "2026-07-30T00:00:00-07:00/2026-08-31T00:00:00-07:00",
+                                "currentDateTime": "2026-08-15T00:00:00-07:00",
+                                "segments": [
+                                    # A service agreement that is not one of the user's accounts.
+                                    {
+                                        "serviceAgreement": {"uuid": _GAS_ACCOUNT_UUID},
+                                        "estimatedUsage": {"value": 1.0, "unit": "KWH"},
+                                    },
+                                    {
+                                        "serviceAgreement": {"uuid": _ELEC_ACCOUNT_UUID},
+                                        # An unrecognized unit falls back to the meter type default.
+                                        "estimatedUsage": {"value": 2.0, "unit": "BTU"},
+                                    },
+                                ],
+                            }
+                        }
+                    },
+                ]
+            }
+        }
+    }
+    session = _FakeSession({"multi-account-v1": _CUSTOMERS_RESPONSE, "dsm-graphql-v1": graphql})
+    forecasts = await _pge(session).async_get_forecast()
+
+    assert len(forecasts) == 1
+    assert forecasts[0].account.uuid == _ELEC_ACCOUNT_UUID
+    assert forecasts[0].unit_of_measure is UnitOfMeasure.KWH
+    assert forecasts[0].forecasted_usage == 2.0
+    # Absent values default to 0 rather than raising.
+    assert forecasts[0].cost_to_date == 0
+
+
+@pytest.mark.asyncio
+async def test_get_forecast_ignores_graphql_errors() -> None:
+    """A GraphQL error yields no forecasts instead of failing the update."""
+    session = _FakeSession(
+        {
+            "multi-account-v1": _CUSTOMERS_RESPONSE,
+            "dsm-graphql-v1": {"errors": [{"message": "Not authorized"}]},
+        }
+    )
+    assert await _pge(session).async_get_forecast() == []
+
+
+@pytest.mark.asyncio
+async def test_cost_reads_parse_tiered_and_time_of_use_components() -> None:
+    """Parse a daily cost response with per-tier, per-TOU-period components."""
+    cost_response = {
+        "servicePointId": "9000000001",
+        "utilityAccountUuid": _ELEC_ACCOUNT_UUID,
+        "unit": "KWH",
+        "siteTimeZoneId": "America/Los_Angeles",
+        "reads": [
+            {
+                "startTime": "2026-07-01T00:00:00.000-07:00",
+                "endTime": "2026-07-02T00:00:00.000-07:00",
+                "value": 29.4584,
+                "readType": "ACTUAL",
+                "providedCost": 9.632872208,
+                "readComponents": [
+                    {
+                        "tierType": "ORDINAL",
+                        "tierNumber": 1,
+                        "season": "SUMMER",
+                        "dayPart": "OFF_PEAK",
+                        "cost": 6.724775951,
+                        "value": 21.6701,
+                    },
+                    {
+                        "tierType": "ORDINAL",
+                        "tierNumber": 2,
+                        "season": "SUMMER",
+                        "dayPart": "ON_PEAK",
+                        "cost": 2.908096257,
+                        "value": 7.7883,
+                    },
+                ],
+                "rebateAmount": 0,
+                "milesDriven": 49,
+                "isPeakPeriod": False,
+            },
+            # Trailing all-zero reads are days that have not been metered yet.
+            {
+                "startTime": "2026-07-02T00:00:00.000-07:00",
+                "endTime": "2026-07-03T00:00:00.000-07:00",
+                "value": 0,
+                "readType": "ACTUAL",
+                "providedCost": 0,
+                "readComponents": None,
+                "rebateAmount": None,
+                "milesDriven": 0,
+                "isPeakPeriod": None,
+            },
+        ],
+        "seriesComponents": None,
+        "ratePlans": None,
+    }
+    session = _FakeSession({"cost/utilityAccount": cost_response})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    result = await _pge(session).async_get_cost_reads(account, AggregateType.DAY, datetime(2026, 7, 1), datetime(2026, 7, 2))
+
+    # The trailing zero read is dropped.
+    assert len(result) == 1
+    tz = ZoneInfo("America/Los_Angeles")
+    assert result[0].start_time == datetime(2026, 7, 1, tzinfo=tz)
+    assert result[0].consumption == 29.4584
+    assert result[0].provided_cost == 9.632872208
+    assert [(c.tier_number, c.day_part, c.cost, c.consumption) for c in result[0].read_components] == [
+        (1, "OFF_PEAK", 6.724775951, 21.6701),
+        (2, "ON_PEAK", 2.908096257, 7.7883),
+    ]
+
+    headers = session.requests[0]["headers"]
+    assert headers["authorization"] == f"Bearer {_ACCESS_TOKEN}"
+    assert json.loads(headers["Opower-Selected-Entities"]) == [f"urn:opower:customer:uuid:{_CUSTOMER_UUID}"]
+
+    # The cost endpoint takes full timestamps, unlike the usage endpoint.
+    params = session.requests[0]["params"]
+    assert params == {
+        "aggregateType": "day",
+        "startDate": "2026-07-01T00:00:00-07:00",
+        "endDate": "2026-07-03T00:00:00-07:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cost_reads_fall_back_to_usage_when_cost_response_is_empty() -> None:
+    """An empty cost response falls back to the usage endpoint.
+
+    PG&E returns no reads from the cost endpoint for recent days on some rate
+    plans, while the usage endpoint still has the consumption.
+    """
+    usage_response = {
+        "startDate": "2026-08-25",
+        "endDate": "2026-08-27",
+        "reads": [
+            {
+                "startTime": "2026-08-25T00:00:00.000-07:00",
+                "endTime": "2026-08-26T00:00:00.000-07:00",
+                "providedCost": None,
+                "milesDriven": 25,
+                "demand": None,
+                "consumption": {"value": 15.0677, "type": "ACTUAL"},
+                "exported": None,
+                "grossConsumption": None,
+                "grossGeneration": None,
+                "imported": None,
+                "reactivePower": None,
+            },
+            {
+                "startTime": "2026-08-26T00:00:00.000-07:00",
+                "endTime": "2026-08-27T00:00:00.000-07:00",
+                "providedCost": None,
+                "milesDriven": 19,
+                "demand": None,
+                "consumption": {"value": 11.4372, "type": "ACTUAL"},
+                "exported": None,
+                "grossConsumption": None,
+                "grossGeneration": None,
+                "imported": None,
+                "reactivePower": None,
+            },
+        ],
+    }
+    cost_response = {
+        "servicePointId": "9000000001",
+        "utilityAccountUuid": _ELEC_ACCOUNT_UUID,
+        "unit": "KWH",
+        "siteTimeZoneId": "America/Los_Angeles",
+        "reads": [],
+        "seriesComponents": [],
+        "ratePlans": [
+            {
+                "code": "HETOUC/NEM2/CCA",
+                "name": None,
+                "meterType": "ELEC",
+                "startDate": "2023-06-12T00:00:00.000-07:00",
+                "endDate": None,
+                "series": {},
+            }
+        ],
+    }
+    session = _FakeSession({"cost/utilityAccount": cost_response, "/reads": usage_response})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    result = await _pge(session).async_get_cost_reads(account, AggregateType.DAY, datetime(2026, 8, 25), datetime(2026, 8, 26))
+
+    assert [read.consumption for read in result] == [15.0677, 11.4372]
+    # No cost is available on this path.
+    assert {read.provided_cost for read in result} == {0.0}
+
+    assert [r["url"].rsplit("/ei/edge/apis/", maxsplit=1)[1] for r in session.requests] == [
+        f"DataBrowser-v1/cws/cost/utilityAccount/{_ELEC_ACCOUNT_UUID}",
+        f"DataBrowser-v1/cws/utilities/pge/utilityAccounts/{_ELEC_ACCOUNT_UUID}/reads",
+    ]
+    # The usage endpoint takes plain dates.
+    assert session.requests[1]["params"] == {
+        "aggregateType": "day",
+        "startDate": "2026-08-25",
+        "endDate": "2026-08-27",
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_reads_parse_reads() -> None:
+    """Usage reads read consumption from the nested consumption object."""
+    usage_response = {
+        "startDate": "2026-07-10",
+        "endDate": "2026-07-11",
+        "reads": [
+            {
+                "startTime": "2026-07-10T00:00:00.000-07:00",
+                "endTime": "2026-07-10T01:00:00.000-07:00",
+                "providedCost": None,
+                "consumption": {"value": 0.58, "type": "ACTUAL"},
+            },
+            {
+                "startTime": "2026-07-10T01:00:00.000-07:00",
+                "endTime": "2026-07-10T02:00:00.000-07:00",
+                "providedCost": None,
+                "consumption": {"value": 0.4942, "type": "ACTUAL"},
+            },
+        ],
+    }
+    session = _FakeSession({"/reads": usage_response})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    result = await _pge(session).async_get_usage_reads(
+        account, AggregateType.HOUR, datetime(2026, 7, 10), datetime(2026, 7, 10)
+    )
+
+    tz = ZoneInfo("America/Los_Angeles")
+    assert [read.consumption for read in result] == [0.58, 0.4942]
+    assert result[0].start_time == datetime(2026, 7, 10, tzinfo=tz)
+    assert result[0].end_time == datetime(2026, 7, 10, 1, tzinfo=tz)
+
+
+@pytest.mark.asyncio
+async def test_hourly_requests_are_batched_and_ordered() -> None:
+    """Hourly ranges are fetched in 26 day windows, newest first, and reassembled."""
+    windows: list[tuple[str, str]] = []
+
+    def cost(params: dict[str, str]) -> dict[str, Any]:
+        windows.append((params["startDate"], params["endDate"]))
+        start = params["startDate"][:10]
+        return {
+            "reads": [
+                {
+                    "startTime": f"{start}T00:00:00.000-07:00",
+                    "endTime": f"{start}T01:00:00.000-07:00",
+                    "value": 1.0,
+                    "providedCost": 0.5,
+                }
+            ]
+        }
+
+    session = _FakeSession({"cost/utilityAccount": cost})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    result = await _pge(session).async_get_cost_reads(account, AggregateType.HOUR, datetime(2026, 6, 1), datetime(2026, 7, 31))
+
+    # 61 days back from the end of 2026-07-31 in 26 day windows.
+    assert [(start[:10], end[:10]) for start, end in windows] == [
+        ("2026-07-06", "2026-08-01"),
+        ("2026-06-09", "2026-07-05"),
+        ("2026-06-01", "2026-06-08"),
+    ]
+    # Reads come back in chronological order even though windows are fetched in reverse.
+    assert [read.start_time.date().isoformat() for read in result] == ["2026-06-01", "2026-06-09", "2026-07-06"]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_type_must_be_supported_by_read_resolution() -> None:
+    """Asking for a finer aggregation than the account supports is rejected."""
+    session = _FakeSession({})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_GAS_ACCOUNT_UUID,
+        utility_account_id="1000000004",
+        id="1000000004",
+        meter_type=MeterType.GAS,
+        read_resolution=ReadResolution.DAY,
+    )
+
+    with pytest.raises(ValueError, match="not supported by account's read_resolution"):
+        await _pge(session).async_get_usage_reads(account, AggregateType.HOUR, datetime(2026, 7, 1), datetime(2026, 7, 2))
+    assert session.requests == []
+
+
+@pytest.mark.asyncio
+async def test_dated_data_requires_a_date_range_unless_bill() -> None:
+    """Only bill aggregation may omit the date range."""
+    session = _FakeSession({"cost/utilityAccount": {"reads": []}})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+    opower = _pge(session)
+
+    with pytest.raises(ValueError, match="start_date is required"):
+        await opower.async_get_usage_reads(account, AggregateType.DAY, None, None)
+    with pytest.raises(ValueError, match="end_date is required"):
+        await opower.async_get_usage_reads(account, AggregateType.DAY, datetime(2026, 7, 1), None)
+
+
+@pytest.mark.asyncio
+async def test_bill_reads_ignore_server_errors() -> None:
+    """A 500 from the bill endpoint means no bills yet, not a failure.
+
+    It happens when the requested range predates the account's activation.
+    """
+    session = _FakeSession({"cost/utilityAccount": _FakeResponse({"error": "server error"}, status=500)})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    assert await _pge(session).async_get_cost_reads(account, AggregateType.BILL) == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_usage_reads_use_the_first_meter() -> None:
+    """Realtime reads come from the first meter of the account."""
+    meters_response = {"MAID": "1000000002", "meters_ids": ["KWH:DELIVERED", "KWH:RECEIVED", "KWH:NET_USAGE"]}
+    usage_response = {
+        "reads": [
+            {"startTime": "2026-09-01T10:00:00.000-07:00", "endTime": "2026-09-01T10:15:00.000-07:00", "value": 0.25},
+            {"startTime": "2026-09-01T10:15:00.000-07:00", "endTime": "2026-09-01T10:30:00.000-07:00", "value": 0.31},
+        ]
+    }
+    session = _FakeSession({"/meters/": usage_response, "/meters": meters_response})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    result = await _pge(session).async_get_realtime_usage_reads(account)
+
+    tz = ZoneInfo("America/Los_Angeles")
+    assert [read.consumption for read in result] == [0.25, 0.31]
+    assert result[0].start_time == datetime(2026, 9, 1, 10, 0, tzinfo=tz)
+    assert session.requests[1]["url"].endswith(
+        f"cws-real-time-ami-v1/cws/pge/accounts/{_ELEC_ACCOUNT_UUID}/meters/KWH:DELIVERED/usage"
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_usage_reads_surface_api_errors() -> None:
+    """A meter without realtime data raises with the status and response body."""
+    meters_response = {"MAID": "1000000002", "meters_ids": ["KWH:DELIVERED"]}
+    error_body = {"error": {"details": "No data returned from API. (00000000-0000-0000-0000-000000000000)"}}
+    session = _FakeSession({"/meters/": _FakeResponse(error_body, status=404), "/meters": meters_response})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    with pytest.raises(ApiException) as exc_info:
+        await _pge(session).async_get_realtime_usage_reads(account)
+
+    assert exc_info.value.status == 404
+    assert "No data returned from API" in (exc_info.value.response_text or "")
+
+
+@pytest.mark.asyncio
+async def test_realtime_usage_reads_require_a_meter() -> None:
+    """An account with no meters cannot serve realtime reads."""
+    session = _FakeSession({"/meters": {"MAID": "1000000002", "meters_ids": []}})
+    account = Account(
+        customer=Customer(uuid=_CUSTOMER_UUID),
+        uuid=_ELEC_ACCOUNT_UUID,
+        utility_account_id="1000000003",
+        id="1000000003",
+        meter_type=MeterType.ELEC,
+        read_resolution=ReadResolution.QUARTER_HOUR,
+    )
+
+    with pytest.raises(CannotConnect):
+        await _pge(session).async_get_realtime_usage_reads(account)
+
+
+def test_select_utility_accepts_name_and_class_name() -> None:
+    """Utilities can be selected by display name or class name, case insensitively."""
+    assert select_utility("pge") is PGE
+    assert select_utility("PGE") is PGE
+    assert select_utility("Pacific Gas and Electric Company (PG&E)") is PGE
+    with pytest.raises(ValueError, match="not found"):
+        select_utility("Not A Utility")
+
+
+def test_supported_utility_names_are_sorted_and_unique() -> None:
+    """Every supported utility contributes exactly one, sorted, display name."""
+    names = get_supported_utility_names()
+
+    assert names == sorted(names)
+    assert len(names) == len(set(names))
+    assert len(names) == len(get_supported_utilities())
+    assert "Pacific Gas and Electric Company (PG&E)" in names
