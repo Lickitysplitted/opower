@@ -1,4 +1,4 @@
-# ruff: noqa: T201, ASYNC230, ASYNC250, PLR0912, PLR0915
+# ruff: noqa: T201, ASYNC230, ASYNC250, PLR0915
 """Demo usage of Opower library."""
 
 import argparse
@@ -8,10 +8,12 @@ import json
 import logging
 from datetime import datetime, timedelta
 from getpass import getpass
+from pathlib import Path
 
 import aiohttp
 
 from opower import (
+    Account,
     AggregateType,
     InvalidAuth,
     MfaChallenge,
@@ -133,7 +135,7 @@ async def _main() -> None:
                 if args.login_data_file:
                     with open(args.login_data_file, "w") as file:
                         json.dump(login_data, file, indent=4)
-                opower.login_data = login_data
+                opower = Opower(session, utility, username, password, totp_secret, login_data)
                 await opower.async_login()
         except InvalidAuth:
             logging.exception("Login failed")
@@ -142,96 +144,94 @@ async def _main() -> None:
         if not args.csv:
             for forecast in await opower.async_get_forecast():
                 print("\nCurrent bill forecast:", forecast)
-        for account in await opower.async_get_accounts():
-            aggregate_type = args.aggregate_type
-            if aggregate_type == AggregateType.HOUR and account.read_resolution == ReadResolution.DAY:
-                aggregate_type = AggregateType.DAY
-            elif aggregate_type != AggregateType.BILL and account.read_resolution == ReadResolution.BILLING:
-                aggregate_type = AggregateType.BILL
-            if not args.csv:
-                print(
-                    "\nGetting historical data: account=",
-                    account,
-                    "aggregate_type=",
-                    aggregate_type,
-                    "start_date=",
-                    args.start_date,
-                    "end_date=",
-                    args.end_date,
-                )
-            prev_end: datetime | None = None
-            # Realtime data does not include cost data, so effectively --realtime implies --usage_only.
-            if args.usage_only or args.realtime:
-                if args.realtime:
-                    usage_data = await opower.async_get_realtime_usage_reads(account)
-                else:
-                    usage_data = await opower.async_get_usage_reads(
-                        account,
-                        aggregate_type,
-                        args.start_date,
-                        args.end_date,
-                    )
-                if args.csv:
-                    with open(args.csv, "w", newline="") as csv_file:
-                        writer = csv.writer(csv_file)
-                        writer.writerow(["start_time", "end_time", "consumption"])
-                        for usage_read in usage_data:
-                            writer.writerow(
-                                [
-                                    usage_read.start_time,
-                                    usage_read.end_time,
-                                    usage_read.consumption,
-                                ]
-                            )
-                else:
-                    print("start_time\tend_time\tconsumption\tstart_minus_prev_end\tend_minus_prev_end")
-                    for usage_read in usage_data:
-                        start_minus_prev_end = None if prev_end is None else usage_read.start_time - prev_end
-                        end_minus_prev_end = None if prev_end is None else usage_read.end_time - prev_end
-                        prev_end = usage_read.end_time
-                        print(
-                            f"{usage_read.start_time}"
-                            f"\t{usage_read.end_time}"
-                            f"\t{usage_read.consumption}"
-                            f"\t{start_minus_prev_end}"
-                            f"\t{end_minus_prev_end}"
-                        )
-                    print()
-            else:
-                cost_data = await opower.async_get_cost_reads(
-                    account,
-                    aggregate_type,
-                    args.start_date,
-                    args.end_date,
-                )
-                if args.csv:
-                    with open(args.csv, "w", newline="") as csv_file:
-                        writer = csv.writer(csv_file)
-                        writer.writerow(["start_time", "end_time", "consumption", "provided_cost"])
-                        for cost_read in cost_data:
-                            writer.writerow(
-                                [
-                                    cost_read.start_time,
-                                    cost_read.end_time,
-                                    cost_read.consumption,
-                                    cost_read.provided_cost,
-                                ]
-                            )
-                else:
-                    print("start_time\tend_time\tconsumption\tprovided_cost\tstart_minus_prev_end\tend_minus_prev_end")
-                    for cost_read in cost_data:
-                        start_minus_prev_end = None if prev_end is None else cost_read.start_time - prev_end
-                        end_minus_prev_end = None if prev_end is None else cost_read.end_time - prev_end
-                        prev_end = cost_read.end_time
-                        print(
-                            f"{cost_read.start_time}"
-                            f"\t{cost_read.end_time}"
-                            f"\t{cost_read.consumption}"
-                            f"\t{cost_read.provided_cost}"
-                            f"\t{start_minus_prev_end}"
-                            f"\t{end_minus_prev_end}"
-                        )
-                    print()
+
+        accounts = await opower.async_get_accounts()
+        for account in accounts:
+            await _output_account(opower, account, args, _csv_path(args.csv, account, len(accounts)))
+
+
+def _csv_path(csv_arg: str | None, account: Account, num_accounts: int) -> Path | None:
+    """Return the CSV file to write for an account, or None when not writing CSV.
+
+    A single account keeps the requested filename. Multiple accounts each get
+    their own file, since one shared file could not tell their rows apart.
+    """
+    if not csv_arg:
+        return None
+    path = Path(csv_arg)
+    if num_accounts == 1:
+        return path
+    return path.with_name(f"{path.stem}-{account.id}{path.suffix}")
+
+
+def _resolve_aggregate_type(requested: AggregateType, read_resolution: ReadResolution | None) -> AggregateType:
+    """Downgrade the requested aggregation to what the account actually supports."""
+    if requested == AggregateType.HOUR and read_resolution == ReadResolution.DAY:
+        return AggregateType.DAY
+    if requested != AggregateType.BILL and read_resolution == ReadResolution.BILLING:
+        return AggregateType.BILL
+    return requested
+
+
+async def _output_account(
+    opower: Opower,
+    account: Account,
+    args: argparse.Namespace,
+    csv_path: Path | None,
+) -> None:
+    """Fetch and print (or write) the historical data for a single account."""
+    aggregate_type = _resolve_aggregate_type(args.aggregate_type, account.read_resolution)
+    if not csv_path:
+        print(
+            "\nGetting historical data: account=",
+            account,
+            "aggregate_type=",
+            aggregate_type,
+            "start_date=",
+            args.start_date,
+            "end_date=",
+            args.end_date,
+        )
+
+    # Realtime data does not include cost data, so effectively --realtime implies --usage_only.
+    if args.usage_only or args.realtime:
+        if args.realtime:
+            usage_data = await opower.async_get_realtime_usage_reads(account)
+        else:
+            usage_data = await opower.async_get_usage_reads(
+                account,
+                aggregate_type,
+                args.start_date,
+                args.end_date,
+            )
+        rows = [(read.start_time, read.end_time, [read.consumption]) for read in usage_data]
+        headers = ["consumption"]
+    else:
+        cost_data = await opower.async_get_cost_reads(
+            account,
+            aggregate_type,
+            args.start_date,
+            args.end_date,
+        )
+        rows = [(read.start_time, read.end_time, [read.consumption, read.provided_cost]) for read in cost_data]
+        headers = ["consumption", "provided_cost"]
+
+    if csv_path:
+        with csv_path.open("w", newline="") as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(["start_time", "end_time", *headers])
+            for start_time, end_time, values in rows:
+                csv_writer.writerow([start_time, end_time, *values])
+        return
+
+    print("\t".join(["start_time", "end_time", *headers, "start_minus_prev_end", "end_minus_prev_end"]))
+    prev_end: datetime | None = None
+    for start_time, end_time, values in rows:
+        start_minus_prev_end = None if prev_end is None else start_time - prev_end
+        end_minus_prev_end = None if prev_end is None else end_time - prev_end
+        prev_end = end_time
+        print("\t".join(str(v) for v in [start_time, end_time, *values, start_minus_prev_end, end_minus_prev_end]))
+    print()
 
 
 if __name__ == "__main__":
