@@ -97,6 +97,8 @@ warn_incomplete_stub = true
 enable_error_code = ["ignore-without-code", "redundant-self", "truthy-iterable"]
 
 [tool.codespell]
+# "secur" is part of the real Salesforce /secur/frontdoor.jsp login URL.
+ignore-words-list = "secur"
 skip = "*.json,*.csv,*.lock,./.git/*,./.venv/*"
 check-filenames = true
 check-hidden = true
