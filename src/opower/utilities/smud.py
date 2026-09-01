@@ -29,12 +29,11 @@ from aiohttp import ClientResponse, ClientSession
 from aiohttp.client_exceptions import ClientResponseError
 from yarl import URL
 
-import opower
-
 from ..const import USER_AGENT
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 class SMUDLoginParser(HTMLParser):
@@ -90,12 +89,15 @@ class SMUDOktaResponseSamlResponseValueParser(HTMLParser):
     """HTML parser to extract SAMLResponse token from OKTA response for Opower SSO."""
 
     # <input name="SAMLResponse" type="hidden" value="..."/>
+    def __init__(self) -> None:
+        """Initialize."""
+        super().__init__()
+        self.saml_response: str | None = None
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         """Try to extract the SAMLResponse value."""
-        if tag == "input":
-            for name, value in attrs:
-                if name == "name" and value == "SAMLResponse":
-                    self.saml_response = attrs[2][1]
+        if tag == "input" and ("name", "SAMLResponse") in attrs:
+            self.saml_response = next((value for name, value in attrs if name == "value"), None)
 
 
 class SMUD(UtilityBase):
@@ -141,7 +143,6 @@ class SMUD(UtilityBase):
             except ClientResponseError:
                 _LOGGER.debug("Failed to login to SMUD with existing cookies")
                 session.cookie_jar.clear()
-                pass
 
         smud_login_page_url = "https://myaccount.smud.org/"
 
@@ -181,7 +182,7 @@ class SMUD(UtilityBase):
 
         login_response_body = await login_response.text()
         if "could not be authenticated" in login_response_body:
-            raise opower.InvalidAuth
+            raise InvalidAuth("Username/Password are invalid")
 
         smud_energyusage_page_url = "https://myaccount.smud.org/manage/opowerresidential/energyusage"
 
@@ -211,7 +212,8 @@ class SMUD(UtilityBase):
         parser = SMUDOktaResponseSamlResponseValueParser()
         parser.feed(await smud_okta_response.text())
         saml_response = parser.saml_response
-        assert saml_response
+        if not saml_response:
+            raise CannotConnect("Could not find the SAMLResponse in the SMUD Okta response")
 
         _LOGGER.debug(
             "Parsed SAMLResponse: %s...%s (%d characters)",
