@@ -16,7 +16,7 @@ from ..const import USER_AGENT
 from ..exceptions import CannotConnect, InvalidAuth, MfaChallenge
 from .base import MfaHandlerBase
 
-_LOGGER = logging.getLogger(__file__)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _load_javascript(text: str, var: str) -> dict[str, Any] | None:
@@ -163,8 +163,15 @@ class ExelonURLHandler:
                 result_json = dict(json.loads(await resp.text(encoding="utf-8")))
         except aiohttp.ClientError as err:
             raise CannotConnect(f"Failed to post during {error_msg} with error: {err}") from err
-        if result_json.get("status", "") != "200":
-            raise InvalidAuth(f"Failed to authenticate during {error_msg} with error: {result_json.get('message', '')}")
+        status = str(result_json.get("status", ""))
+        if status != "200":
+            message = result_json.get("message", "")
+            # Only an explicit rejection means the credentials/code were wrong.
+            # Anything else (a 404, a 5xx outage) is retryable and must not
+            # trigger a Home Assistant reauth prompt.
+            if status not in ("400", "401", "403"):
+                raise CannotConnect(f"Exelon returned status {status} during {error_msg}: {message}")
+            raise InvalidAuth(f"Failed to authenticate during {error_msg} with error: {message}")
         return result_json
 
     async def refresh_refresh(self) -> str:
@@ -200,7 +207,15 @@ class ExelonURLHandler:
         return str(result_json.get("access_token", ""))
 
     async def refresh_token(self, data: dict[str, str]) -> Any:
-        """Generate a token from the data and return the field."""
+        """Generate a token from the data and return the field.
+
+        Returns an empty dict when the stored refresh token was rejected, so the
+        caller falls through to the interactive MFA flow and Home Assistant
+        prompts for a new code.
+
+        :raises CannotConnect: if the request failed for a reason that says
+            nothing about the token (5xx, network error)
+        """
         try:
             async with self._session.post(
                 f"https://{self._base_url}/oauth2/v2.0/token",
@@ -209,9 +224,17 @@ class ExelonURLHandler:
                 raise_for_status=True,
             ) as resp:
                 result_json = await resp.json()
+        except aiohttp.ClientResponseError as err:
+            if err.status in (400, 401, 403):
+                # The stored refresh token really is no longer usable: fall
+                # through so async_login restarts the MFA flow.
+                _LOGGER.debug("Exelon rejected the stored refresh token: %s", err)
+                return {}
+            # A 5xx says nothing about the token. Discarding it here would send
+            # the user back through the whole MFA flow over a transient blip.
+            raise CannotConnect(f"Failed to refresh the Exelon token: {err}") from err
         except aiohttp.ClientError as err:
-            _LOGGER.warning("Failed to obtain refresh token thus likely unauthorized due to error: %s", err)
-            return {}
+            raise CannotConnect(f"Failed to refresh the Exelon token: {err}") from err
 
         return result_json
 
@@ -348,11 +371,13 @@ class ExelonMfaHandler(MfaHandlerBase):
             # NOTE MFA supports Text, Email, and Call
             # Call requires polling, which is outside
             # the scope of supporting this type of flow
+            # Only one of the two may be present, e.g. when the MFA condition
+            # was not recognized in async_get_mfa_options.
             _ = await self._exelon_handler.postapi(
                 "",
                 {
-                    "displayEmailAddress": self._mfa_options["Email"],
-                    "displayPhoneNumber": self._mfa_options["Text"],
+                    "displayEmailAddress": self._mfa_options.get("Email", ""),
+                    "displayPhoneNumber": self._mfa_options.get("Text", ""),
                     "mfaEnabledRadio": self._option_id,
                     "request_type": "RESPONSE",
                 },
@@ -363,10 +388,10 @@ class ExelonMfaHandler(MfaHandlerBase):
 
         if self._option_id == "Text":
             verify_url = "DisplayControlAction/vbeta/textVerificationControl/SendCode"
-            verify_data = {"displayPhoneNumber": self._mfa_options["Text"]}
+            verify_data = {"displayPhoneNumber": self._mfa_options.get("Text", "")}
         else:
             verify_url = "DisplayControlAction/vbeta/emailVerificationControl/SendCode"
-            verify_data = {"displayEmailAddress": self._mfa_options["Email"]}
+            verify_data = {"displayEmailAddress": self._mfa_options.get("Email", "")}
 
         _ = await self._exelon_handler.postapi(verify_url, verify_data, "MFA verify")
 
@@ -378,13 +403,13 @@ class ExelonMfaHandler(MfaHandlerBase):
         if self._option_id == "Text":
             submit_url = "DisplayControlAction/vbeta/textVerificationControl/VerifyCode"
             submit_data = {
-                "displayPhoneNumber": self._mfa_options["Text"],
+                "displayPhoneNumber": self._mfa_options.get("Text", ""),
                 "verificationCode": code,
             }
         else:
             submit_url = "DisplayControlAction/vbeta/emailVerificationControl/VerifyCode"
             submit_data = {
-                "displayEmailAddress": self._mfa_options["Email"],
+                "displayEmailAddress": self._mfa_options.get("Email", ""),
                 "verificationCode": code,
             }
 
@@ -432,7 +457,8 @@ class Exelon:
 
     def subdomain(self) -> str:
         """Return the opower.com subdomain for this utility."""
-        assert self._subdomain, "async_login not called"
+        if not self._subdomain:
+            raise CannotConnect("async_login was not called before subdomain")
         return self._subdomain
 
     @staticmethod
@@ -491,9 +517,11 @@ class Exelon:
 
             # Make sure we were redirected to an authorize endpoint which changes our base URL
             if path.endswith("/authorize"):
-                assert login_post_domain, "no real host found"
+                if not login_post_domain:
+                    raise CannotConnect("No host found on the Exelon authorize redirect")
                 settings = _load_javascript(result, "SETTINGS")
-                assert settings is not None, "settings not found"
+                if settings is None:
+                    raise CannotConnect("No SETTINGS found on the Exelon authorize page")
 
                 # Here we employ a hack. Mobile apps know where their tenants are, so they do not need
                 # to visit the login page. They can be updated whereas the login domain is unlikely to be updated
