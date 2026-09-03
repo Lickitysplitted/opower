@@ -34,7 +34,6 @@
 # `python -m opower --utility aesindiana --username you@example.com -v`
 
 import logging
-from html.parser import HTMLParser
 from typing import Any
 
 import aiohttp
@@ -43,73 +42,12 @@ from yarl import URL
 from ..const import USER_AGENT
 from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
+from .helpers import parse_forms
 
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_HOPS = 15
 _LOGIN_URL = URL("https://aesi.opower.com/ei/x/dashboard")
-
-
-class Form:
-    """A parsed HTML form: its action and the fields a browser would submit."""
-
-    def __init__(self, action: str | None) -> None:
-        """Initialize."""
-        self.action = action
-        self.inputs: dict[str, str] = {}
-        self.has_password = False
-        self._submit_seen = False
-
-    def add_input(self, attrs: dict[str, str | None]) -> None:
-        """Add an input field, applying browser form-submission rules."""
-        name = attrs.get("name")
-        input_type = (attrs.get("type") or "text").lower()
-        if input_type == "password":
-            self.has_password = True
-        if not name:
-            return
-        # Match what a browser submits: skip non-submitting controls,
-        # unchecked boxes, and all but the activated (first) submit button.
-        if input_type in ("button", "reset", "image"):
-            return
-        if input_type in ("checkbox", "radio") and "checked" not in attrs:
-            return
-        if input_type == "submit":
-            if self._submit_seen:
-                return
-            self._submit_seen = True
-        self.inputs[name] = attrs.get("value") or ""
-
-
-class FormsParser(HTMLParser):
-    """HTML parser that captures every form on the page with its input fields."""
-
-    def __init__(self) -> None:
-        """Initialize."""
-        super().__init__()
-        self.forms: list[Form] = []
-        self._current: Form | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        """Track forms and collect their inputs."""
-        attrs_dict = dict(attrs)
-        if tag == "form":
-            self._current = Form(attrs_dict.get("action"))
-            self.forms.append(self._current)
-        elif tag == "input" and self._current is not None:
-            self._current.add_input(attrs_dict)
-
-    def handle_endtag(self, tag: str) -> None:
-        """Close the current form."""
-        if tag == "form":
-            self._current = None
-
-
-def _parse_forms(html: str) -> list[Form]:
-    """Parse all forms out of an HTML page."""
-    parser = FormsParser()
-    parser.feed(html)
-    return parser.forms
 
 
 def _is_opower(url: URL) -> bool:
@@ -169,7 +107,7 @@ async def _request(
 
 def _is_allowed_sso_host(url: URL) -> bool:
     """Check an SSO form target before posting assertion material to it."""
-    return (
+    return url.scheme == "https" and (
         url.host == "myaccount.aesindiana.com"
         or (url.host is not None and url.host.endswith(".identity.oraclecloud.com"))
         or _is_opower(url)
@@ -182,12 +120,12 @@ async def _complete_sso(session: aiohttp.ClientSession, url: URL, html: str) -> 
         if _is_opower(url):
             return
         form = next(
-            (f for f in _parse_forms(html) if "SAMLResponse" in f.inputs or "OCIS_REQ_SP" in f.inputs),
+            (f for f in parse_forms(html) if "SAMLResponse" in f.inputs or "OCIS_REQ_SP" in f.inputs),
             None,
         )
         if form is None:
             # Served the login page again => bad credentials.
-            if any(f.has_password for f in _parse_forms(html)):
+            if any(f.has_password for f in parse_forms(html)):
                 raise InvalidAuth("Invalid AES Indiana credentials")
             raise CannotConnect(f"Unexpected page during AES Indiana SSO: {_redact(url)}")
         # An empty/missing action means "submit to the current URL".
@@ -208,8 +146,7 @@ class AESIndiana(UtilityBase):
         """Return the name of the utility."""
         return "AES Indiana"
 
-    @staticmethod
-    def subdomain() -> str:
+    def subdomain(self) -> str:
         """Return the opower.com subdomain for this utility."""
         return "aesi"
 
@@ -249,14 +186,22 @@ class AESIndiana(UtilityBase):
 
         # Step 2: if we are on the login page, POST the login form with the
         # fields it served (all scraped at once), plus the credentials.
-        login_form = next((f for f in _parse_forms(html) if f.has_password), None)
+        login_form = next((f for f in parse_forms(html) if f.has_password), None)
         if login_form is not None:
+            filled = set()
             for name in list(login_form.inputs):
                 if "username" in name.lower():
                     login_form.inputs[name] = username
+                    filled.add("username")
                 elif "password" in name.lower():
                     login_form.inputs[name] = password
-            url, html = await _request(session, "POST", url, login_form.inputs, auth_request=True, referer=url)
+                    filled.add("password")
+            if filled != {"username", "password"}:
+                raise CannotConnect("Could not find the username/password fields on the AES Indiana login page")
+            # Post to the form's action like a browser would (relative to the
+            # page URL); an empty/missing action means the current URL.
+            action = url.join(URL(login_form.action, encoded=True)) if login_form.action else url
+            url, html = await _request(session, "POST", action, login_form.inputs, auth_request=True, referer=url)
 
         # Step 3/4: follow auto-submit forms until we land back on opower.
         await _complete_sso(session, url, html)
