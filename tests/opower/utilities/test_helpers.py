@@ -101,6 +101,12 @@ class TestGetFormActionUrlAndHiddenInputs(unittest.TestCase):
         self.assertEqual("https://idcs-abc.identity.oraclecloud.com/fed/v1/sp/sso", action)
         self.assertEqual({"SAMLResponse": "c2FtbA==", "RelayState": "xyz"}, inputs)
 
+    def test_first_form_only(self) -> None:
+        """Only the first form is used; later forms' fields cannot leak in."""
+        action, inputs = get_form_action_url_and_hidden_inputs(LOGIN_PAGE_HTML)
+        self.assertEqual("/search", action)
+        self.assertEqual({}, inputs)
+
     def test_no_form(self) -> None:
         """A page without forms returns empty values."""
         action, inputs = get_form_action_url_and_hidden_inputs("<html><body>hi</body></html>")

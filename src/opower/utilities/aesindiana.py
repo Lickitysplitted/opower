@@ -94,7 +94,11 @@ async def _request(
                 except ValueError as err:
                     raise CannotConnect("Invalid redirect target during AES Indiana login") from err
                 _LOGGER.debug("Redirect -> %s", _redact(url))
-                if resp.status not in (307, 308):
+                if resp.status in (307, 308):
+                    # 307/308 re-send the body; never forward it off the SSO hosts.
+                    if data is not None and not _is_allowed_sso_host(url):
+                        raise CannotConnect(f"Unexpected redirect target for AES Indiana POST: {_redact(url)}")
+                else:
                     method = "GET"
                     data = None
                 continue
@@ -201,6 +205,8 @@ class AESIndiana(UtilityBase):
             # Post to the form's action like a browser would (relative to the
             # page URL); an empty/missing action means the current URL.
             action = url.join(URL(login_form.action, encoded=True)) if login_form.action else url
+            if not _is_allowed_sso_host(action):
+                raise CannotConnect(f"Unexpected AES Indiana login form target: {_redact(action)}")
             url, html = await _request(session, "POST", action, login_form.inputs, auth_request=True, referer=url)
 
         # Step 3/4: follow auto-submit forms until we land back on opower.

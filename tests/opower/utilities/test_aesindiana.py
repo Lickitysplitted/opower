@@ -40,6 +40,13 @@ SAML_TO_UNEXPECTED_HOST_HTML = """
 </form>
 """
 
+EVIL_ACTION_LOGIN_HTML = """
+<form method="post" action="https://evil.example.com/login">
+  <input type="text" name="ctl00$iplLogin$UserName" />
+  <input type="password" name="ctl00$iplLogin$Password" />
+</form>
+"""
+
 RENAMED_FIELDS_LOGIN_HTML = """
 <form method="post" action="">
   <input type="text" name="ctl00$login$Account" />
@@ -232,6 +239,31 @@ class TestLoginFlow(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(CannotConnect):
             await AESIndiana().async_login(session, "user@example.com", "hunter2", {})  # type: ignore[arg-type]
+
+    async def test_login_form_to_unexpected_host(self) -> None:
+        """A login form targeting a host outside the allow-list never receives credentials."""
+        session = FakeSession(
+            {
+                ("GET", DASHBOARD_URL): [FakeResponse(DASHBOARD_URL, 302, location=LOGIN_URL)],
+                ("GET", LOGIN_URL): [FakeResponse(LOGIN_URL, body=EVIL_ACTION_LOGIN_HTML)],
+            }
+        )
+        with self.assertRaises(CannotConnect):
+            await AESIndiana().async_login(session, "user@example.com", "hunter2", {})  # type: ignore[arg-type]
+        self.assertFalse(any(method == "POST" for method, _, _ in session.requests))
+
+    async def test_login_post_not_forwarded_offhost(self) -> None:
+        """A 307 redirect of the credential POST to an off-list host is refused."""
+        session = FakeSession(
+            {
+                ("GET", DASHBOARD_URL): [FakeResponse(DASHBOARD_URL, 302, location=LOGIN_URL)],
+                ("GET", LOGIN_URL): [FakeResponse(LOGIN_URL, body=LOGIN_PAGE_HTML)],
+                ("POST", LOGIN_POST_URL): [FakeResponse(LOGIN_POST_URL, 307, location="https://evil.example.com/sink")],
+            }
+        )
+        with self.assertRaises(CannotConnect):
+            await AESIndiana().async_login(session, "user@example.com", "hunter2", {})  # type: ignore[arg-type]
+        self.assertFalse(any("evil.example.com" in url for _, url, _ in session.requests))
 
     async def test_sso_form_to_unexpected_host(self) -> None:
         """An SSO form targeting a host outside the allow-list is not posted."""
